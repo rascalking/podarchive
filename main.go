@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 
 	"github.com/fujiwara/shapeio"
 	"github.com/gosimple/slug"
@@ -17,9 +18,9 @@ import (
 // TODO: update rss feed with local links for audio files before writing to disk
 // TODO: download item images, update rss feed with local links for them
 // TODO: generate html representation of the rss feed
-// TODO: flag for basedir to archive podcast to
+// TODO: flag for basedir to archive podcast(s) to
 
-const rateLimit = 1024 * 1024 * 10 // 10MB/s
+const rateLimit = 1024 * 1024 * 5 // 5 Mbps
 
 func main() {
 	parser := gofeed.NewParser()
@@ -29,7 +30,7 @@ func main() {
 			log.Print(err)
 			continue
 		}
-		log.Printf("Processing %v (%v)\n", feed.Title, feedURL)
+		log.Printf("INFO - Processing %v (%v)\n", feed.Title, feedURL)
 
 		baseDir, err := os.Getwd()
 		if err != nil {
@@ -53,6 +54,11 @@ func main() {
 				continue
 			}
 			enclosure := item.Enclosures[0]
+			enclosureLength, err := strconv.ParseInt(enclosure.Length, 10, 64)
+			if err != nil {
+				log.Print(err)
+				continue
+			}
 
 			itemDir := filepath.Join(feedDir, slug.Make(item.GUID))
 			err = os.Mkdir(itemDir, 0755)
@@ -66,8 +72,20 @@ func main() {
 				log.Print(err)
 				continue
 			}
-			itemPath := filepath.Join(itemDir, filepath.Base(enclosureURL.Path))
-			// TODO: continue if we have the full enclosure already
+			enclosurePath := filepath.Join(itemDir, filepath.Base(enclosureURL.Path))
+			if stat, err := os.Stat(enclosurePath); err == nil {
+				resp, err := http.Head(enclosure.URL)
+				if err != nil {
+					log.Printf("ERROR: %v %v\n", enclosure.URL, err)
+					continue
+				}
+				if resp.ContentLength == stat.Size() {
+					log.Printf("INFO: %v already downloaded, skipping\n", enclosure.URL)
+					continue
+				} else {
+					log.Printf("WARN: %v partially downloaded, overwriting\n", enclosure.URL)
+				}
+			}
 
 			resp, err := http.Get(enclosure.URL)
 			if err != nil {
@@ -75,24 +93,31 @@ func main() {
 				continue
 			}
 			defer resp.Body.Close()
-			// TODO: verify response content-length matches enclosure length
 
-			itemFile, err := os.OpenFile(itemPath, os.O_RDWR|os.O_CREATE, 0644)
+			if resp.ContentLength != enclosureLength {
+				log.Printf("WARN: %v enclosure length %#v, content length %#v\n",
+					enclosure.URL, enclosureLength, resp.ContentLength)
+			}
+
+			enclosureFile, err := os.OpenFile(enclosurePath, os.O_RDWR|os.O_CREATE, 0644)
 			if err != nil {
 				log.Print(err)
 				continue
 			}
-			defer itemFile.Close()
+			defer enclosureFile.Close()
 
 			reader := shapeio.NewReader(resp.Body)
 			reader.SetRateLimit(rateLimit)
-			_, err = io.Copy(itemFile, reader)
+			copyLength, err := io.Copy(enclosureFile, reader)
 			if err != nil {
 				log.Print(err)
-				// TODO: remove partially downloaded file
+				os.Remove(enclosurePath)
 				continue
 			}
-			// TODO: verify io.Copy return value matches enclosure length
+			if copyLength != resp.ContentLength {
+				log.Printf("WARN: %v download length %#v, content length %#v\n",
+					enclosure.URL, copyLength, resp.ContentLength)
+			}
 		}
 	}
 }
